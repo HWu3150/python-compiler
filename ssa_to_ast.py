@@ -7,7 +7,7 @@ from numba.core import ir
 
 
 """
-Mapping between SSA operators to AST operators
+Mapping between SSA operators and AST operators
 """
 op_map = {
     'add': ast.Add,
