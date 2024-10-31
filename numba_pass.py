@@ -120,8 +120,9 @@ class MyCompiler(CompilerBase):  # custom compiler extends from CompilerBase
 
     def define_pipelines(self):
         pm = DefaultPassBuilder.define_nopython_pipeline(self.state)
-        #pm.add_pass_after(PrintAssignments, IRProcessing)
+        #pm.add_pass_after(ConstsAddOne, IRProcessing)
         pm.add_pass_after(PrintAssignments, ReconstructSSA)
+        #pm.add_pass_after(PrintAssignments, ReconstructSSA)
         pm.finalize()
         return [pm]
 
