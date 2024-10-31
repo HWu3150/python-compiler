@@ -4,6 +4,8 @@ import os
 
 from graphviz import Digraph
 
+from ssa_to_ast import ssa_to_ast
+
 
 def get_ast(func, print_tree=False):
     """
@@ -72,7 +74,7 @@ def gen_ast_visualization(node, graph=None, parent=None):
     return graph
 
 
-def visualize(func):
+def visualize(func, ssa_statements=None):
     """
     Visualize the AST of the function, AST graph will be stored under results directory.
 
@@ -82,9 +84,18 @@ def visualize(func):
     Returns:
 
     """
+    # Generate Python AST graph
     filename = f"{func.__name__} Python AST"
     output_path = os.path.join("results", filename)
     tree = get_ast(func)
     tree_viz = gen_ast_visualization(tree)
     tree_viz.render(filename=output_path, format="png", cleanup=True)
+
+    # Generate graph of AST form SSA
+    if ssa_statements is not None:
+        tree_from_ssa = ssa_to_ast(ssa_statements, func)
+        tree_from_ssa_viz = gen_ast_visualization(tree_from_ssa)
+        filename = f"{func.__name__} AST from SSA"
+        output_path = os.path.join("results", filename)
+        tree_from_ssa_viz.render(filename=output_path, format="png", cleanup=True)
 
