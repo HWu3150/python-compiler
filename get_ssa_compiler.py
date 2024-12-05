@@ -34,3 +34,4 @@ class GetSSACompiler(CompilerBase):
         # pm.add_pass_after(GetSSAPass, ReconstructSSA)
         pm.add_pass_after(GetSSAPass, IRProcessing)
         pm.finalize()
+        return [pm]
