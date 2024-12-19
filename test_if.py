@@ -9,14 +9,11 @@ print(numba.__version__)
 print(numba.config.__dict__)
 
 @njit(pipeline_class=GetSSACompiler)
-def test_loop():
+def test_if():
     x = 0
     while x < 5:
-        y = 1
-        x += y
-        while x % 2 == 0:
-            x += 1
-        x += 1
+        if x % 2 == 0:
+            x += 2
     return x
 
 
@@ -24,7 +21,7 @@ ssa_by_blocks.clear()
 blocks.clear()
 func_ir = None
 
-test_loop()
+test_if()
 print("SSA Statements Grouped by Block:")
 for blk_offset, ssa_list in ssa_by_blocks.items():
     print(f"Block {blk_offset}:")
@@ -32,4 +29,4 @@ for blk_offset, ssa_list in ssa_by_blocks.items():
         print(f"  {stmt}")
 print()
 
-viz_ast_and_cfg(blocks, test_loop)
+viz_ast_and_cfg(blocks, test_if)
