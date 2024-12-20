@@ -109,7 +109,11 @@ def convert_stmt_to_node(stmt,
                          args):
     """
     Args:
-    SSA statement
+        stmt: SSA statement.
+        inplace_ops: Inplace operation map.
+        arithmetic_ops: Arithmetic operation map.
+        compare_ops: Compare operation map.
+        aug_assigns_targets:
 
     Returns:
     AST node representing the statement
@@ -162,10 +166,13 @@ def convert_stmt_to_node(stmt,
         if isinstance(stmt.value, ir.Var):
             if 'phi' in stmt.value.name or 'iter' in stmt.value.name:
                 return None
-            if stmt.target not in aug_assigns_targets and stmt.value not in aug_assigns_targets:
+            value_node = fetch_node_def(stmt.value.name, ssa_var_map, ast.Load())
+            if isinstance(value_node, ast.AugAssign):
+                return value_node
+            else:
                 return ast.Assign(
-                    targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                    value=ast.Name(id=stmt.value.name, ctx=ast.Load())
+                    targets=[fetch_node_def(stmt.target.name, ssa_var_map, ast.Load())],
+                    value=value_node
                 )
 
         # R.H.S of Assign is Const
@@ -197,12 +204,12 @@ def convert_stmt_to_node(stmt,
 
         # R.H.S of Assign is inplace binop, e.g., x += 1 -> $tmp = inplace(add, x, 1)
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'inplace_binop':
-            aug_assigns_targets.append(stmt.target)
-            return ast.AugAssign(
+            aug_assign_node = ast.AugAssign(
                 target=fetch_node_def(stmt.value.lhs.name, ssa_var_map, ast.Store()),
                 op=inplace_ops[stmt.value.fn],
                 value=fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load()),
             )
+            return return_or_store(stmt.target.name, aug_assign_node, ssa_var_map)
 
         # Expr
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'cast':
@@ -238,16 +245,19 @@ def convert_stmt_to_node(stmt,
 
     # Deal with y[i] = ...
     elif isinstance(stmt, ir.SetItem):
-        rhs_node = fetch_node_def(stmt.value.name, ssa_var_map, ast.Load())
-        subscript_node = ast.Subscript(
-            value=ast.Name(id=stmt.target.name, ctx=ast.Load()),
-            slice=ast.Name(id=stmt.index.name, ctx=ast.Load()),
-            ctx=ast.Load()
-        )
-        return ast.Assign(
-            targets=[subscript_node],
-            value=rhs_node
-        )
+        value_node = fetch_node_def(stmt.value.name, ssa_var_map, ast.Load())
+        if isinstance(value_node, ast.AugAssign):
+            return value_node
+        else:
+            subscript_node = ast.Subscript(
+                value=ast.Name(id=stmt.target.name, ctx=ast.Load()),
+                slice=ast.Name(id=stmt.index.name, ctx=ast.Load()),
+                ctx=ast.Load()
+            )
+            return ast.Assign(
+                targets=[subscript_node],
+                value=value_node
+            )
 
     # Return
     elif isinstance(stmt, ir.Return):
