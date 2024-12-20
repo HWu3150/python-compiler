@@ -11,7 +11,7 @@ print(numba.__version__)
 print(numba.config.__dict__)
 
 @njit(pipeline_class=GetSSACompiler)
-def test_loop():
+def test_for_loop():
     x = 0
     for i in range(10):
         for j in range(10):
@@ -24,7 +24,7 @@ ssa_by_blocks.clear()
 blocks.clear()
 func_ir = None
 
-test_loop()
+test_for_loop()
 print("SSA Statements Grouped by Block:")
 for blk_offset, ssa_list in ssa_by_blocks.items():
     print(f"Block {blk_offset}:")
@@ -32,4 +32,4 @@ for blk_offset, ssa_list in ssa_by_blocks.items():
         print(f"  {stmt}")
 print()
 
-viz_ast_and_cfg(blocks, test_loop)
+viz_ast_and_cfg(blocks, test_for_loop)

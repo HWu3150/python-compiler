@@ -92,19 +92,29 @@ def compute_unnecessary_variables(block, label, loops, cfg):
                 unnecessary_vars.add(var)
     return unnecessary_vars
 
+def convert_to_original_var(ssa_var_name, original_var_list):
+    """
+    Convert an SSA var back to original version, e.g., x.1 -> x
 
-def fetch_node_def(var_name, var_map, ast_ctx):
-    if var_name in var_map:
-        return var_map[var_name]
-    else:
-        return ast.Name(id=var_name, ctx=ast_ctx)
+    Args:
+        ssa_var_name: SSA variable name.
+        original_var_list: List of original variables.
 
+    Returns:
+        Variable name.
+    """
+    if '$' not in ssa_var_name and '.' in ssa_var_name:
+        base_var = ssa_var_name.split('.')[0]
+        for original_var in original_var_list:
+            if original_var == base_var:
+                return original_var
+    return ssa_var_name
 
 def convert_stmt_to_node(stmt,
                          inplace_ops,
                          arithmetic_ops,
                          compare_ops,
-                         aug_assigns_targets,
+                         original_vars,
                          ssa_var_map,
                          args):
     """
@@ -113,17 +123,43 @@ def convert_stmt_to_node(stmt,
         inplace_ops: Inplace operation map.
         arithmetic_ops: Arithmetic operation map.
         compare_ops: Compare operation map.
-        aug_assigns_targets:
+        original_vars: Original variable list.
+        ssa_var_map: Mapping intermediate SSA variables ($...) to AST node.
+        args: Function argument list.
 
     Returns:
-    AST node representing the statement
+        AST node representing the statement
     """
+
+    def fetch_node_def(var_name, var_map, ast_ctx):
+        """
+        Fetch node representing var_name. If not found, return var_name as a new node.
+
+        Args:
+            var_name: Name of the variable.
+            var_map: Mapping var_name to AST node.
+            ast_ctx: Context of the AST node.
+
+        Returns:
+            AST node.
+        """
+        if var_name in var_map:
+            return var_map[var_name]
+        else:
+            return ast.Name(id=convert_to_original_var(var_name, original_vars), ctx=ast_ctx)
 
     # Assign
     if isinstance(stmt, ir.Assign):
 
+        target_name = stmt.target.name
+
+        # These are useless variables.
         if 'phi' in stmt.target.name or 'iter' in stmt.target.name:
             return None
+
+        # Store original variables.
+        if '$' not in stmt.target.name and '.' not in stmt.target.name:
+            original_vars.append(stmt.target.name)
 
         # Function argument
         if isinstance(stmt.value, ir.Arg):
@@ -131,12 +167,14 @@ def convert_stmt_to_node(stmt,
                 arg=stmt.value.name
             ))
 
+        # R.H.S is Global
         if isinstance(stmt.value, ir.Global):
             if stmt.value.name == 'range':
-                ssa_var_map[stmt.target.name] = ast.Name(id='range', ctx=ast.Load())
+                ssa_var_map[target_name] = ast.Name(id='range', ctx=ast.Load())
             if stmt.value.name == 'np':
-                ssa_var_map[stmt.target.name] = ast.Name(id='np', ctx=ast.Load())
+                ssa_var_map[target_name] = ast.Name(id='np', ctx=ast.Load())
 
+        # R.H.S is Expression
         if isinstance(stmt.value, ir.Expr) and stmt.value.op == 'call':
             call_body = stmt.value._kws
             func_name = call_body['func'].name
@@ -158,7 +196,7 @@ def convert_stmt_to_node(stmt,
                     )
                 else:
                     return ast.Assign(
-                        targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
+                        targets=[ast.Name(id=target_name, ctx=ast.Store())],
                         value=call_node
                     )
 
@@ -171,14 +209,14 @@ def convert_stmt_to_node(stmt,
                 return value_node
             else:
                 return ast.Assign(
-                    targets=[fetch_node_def(stmt.target.name, ssa_var_map, ast.Load())],
+                    targets=[fetch_node_def(target_name, ssa_var_map, ast.Load())],
                     value=value_node
                 )
 
         # R.H.S of Assign is Const
         elif isinstance(stmt.value, ir.Const):
             const_node = ast.Constant(value=stmt.value.value)
-            return return_or_store(stmt.target.name, const_node, ssa_var_map)
+            return return_or_store(target_name, const_node, ssa_var_map)
 
         # R.H.S of Assign is a binop
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'binop':
@@ -198,7 +236,7 @@ def convert_stmt_to_node(stmt,
                     comparators=[fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load())],
                 )
             if op_node is not None:
-                return return_or_store(stmt.target.name, op_node, ssa_var_map)
+                return return_or_store(target_name, op_node, ssa_var_map)
             else:
                 raise ValueError("Unsupported binary operation!")
 
@@ -209,19 +247,22 @@ def convert_stmt_to_node(stmt,
                 op=inplace_ops[stmt.value.fn],
                 value=fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load()),
             )
-            return return_or_store(stmt.target.name, aug_assign_node, ssa_var_map)
+            if '$' not in target_name:
+                return aug_assign_node
+            else:
+                return return_or_store(target_name, aug_assign_node, ssa_var_map)
 
         # Expr
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'cast':
-            var_node = ast.Name(id=stmt.value._kws['value'], ctx=ast.Load())
-            return return_or_store(stmt.target.name, var_node, ssa_var_map)
+            var_node = ast.Name(id=convert_to_original_var(stmt.value._kws['value'].name, original_vars), ctx=ast.Load())
+            return return_or_store(target_name, var_node, ssa_var_map)
 
         # Build tuple, e.g., [i, j] of A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'build_tuple':
             tuple_node = ast.Tuple(elts=[], ctx=ast.Load())
             for var in stmt.value.items:
                 tuple_node.elts.append(fetch_node_def(var.name, ssa_var_map, ast.Load()))
-            return return_or_store(stmt.target.name, tuple_node, ssa_var_map)
+            return return_or_store(target_name, tuple_node, ssa_var_map)
 
         # Subscripting, e.g., A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getitem":
@@ -232,7 +273,7 @@ def convert_stmt_to_node(stmt,
                 slice=slice_node,
                 ctx=ast.Load()
             )
-            return return_or_store(stmt.target.name, subscript_node, ssa_var_map)
+            return return_or_store(target_name, subscript_node, ssa_var_map)
 
         # Get attribute, e.g., A.shape, np.zeros
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getattr":
@@ -241,7 +282,7 @@ def convert_stmt_to_node(stmt,
                 attr=stmt.value.attr,
                 ctx=ast.Load()
             )
-            return return_or_store(stmt.target.name, attribute_node, ssa_var_map)
+            return return_or_store(target_name, attribute_node, ssa_var_map)
 
     # Deal with y[i] = ...
     elif isinstance(stmt, ir.SetItem):
@@ -267,12 +308,23 @@ def convert_stmt_to_node(stmt,
     return None
 
 def return_or_store(var_name, ast_node, var_map):
+    """
+    Return ast.Assign of ast_node, or store it if the node is part of another node.
+
+    Args:
+        var_name: Name of the variable.
+        ast_node: AST node.
+        var_map: Mapping var_name to AST node.
+
+    Returns:
+        AST node.
+    """
     if "$" in var_name:
         var_map[var_name] = ast_node
         return None
     else:
         return ast.Assign(
-            targets=[var_name],
+            targets=[ast.Name(id=var_name, ctx=ast.Load())],
             value=ast_node
         )
 
@@ -327,7 +379,7 @@ def process_for_node(label, loops, cfg, blocks, for_node):
 
     return for_node
 
-def convert_block_to_ast(label, loops, cfg, blocks, args):
+def convert_block_to_ast(label, loops, cfg, blocks, args, original_vars):
     """
     Args:
         label: Label of the basic block.
@@ -369,7 +421,6 @@ def convert_block_to_ast(label, loops, cfg, blocks, args):
 
     ast_nodes = list()
     unnecessary_vars = compute_unnecessary_variables(block, label, loops, cfg)
-    aug_assign_targets = list()
     ssa_var_map = defaultdict()
 
     # Convert regular stmt to AST node
@@ -382,7 +433,7 @@ def convert_block_to_ast(label, loops, cfg, blocks, args):
                                         inplace_ops,
                                         arithmetic_ops,
                                         compare_ops,
-                                        aug_assign_targets,
+                                        original_vars,
                                         ssa_var_map,
                                         args)
         if ast_node is not None:
@@ -440,11 +491,12 @@ def construct_ast(blocks):
     cfg = compute_cfg_from_blocks(blocks)
     loop_header_to_body = cfg._find_loops()
     arg_list = list()
+    original_vars = list()
 
     # Compute AST node list of each block
     all_ast_nodes = defaultdict(list)
     for label, block in blocks.items():
-        ast_nodes = convert_block_to_ast(label, loop_header_to_body, cfg, blocks, arg_list)
+        ast_nodes = convert_block_to_ast(label, loop_header_to_body, cfg, blocks, arg_list, original_vars)
         all_ast_nodes[label] = ast_nodes
 
     loop_entry_to_body = defaultdict(list)
