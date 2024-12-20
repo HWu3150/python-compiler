@@ -40,23 +40,6 @@ def is_in_any_loop(label, loops):
             return True
     return False
 
-def is_if_branch(label, loops, cfg):
-    if is_loop_entry(label, loops):
-        return False
-    if is_in_any_loop(label, loops):
-        # find in which loop the block lies
-        loop_exit = None
-        for loop_label, loop in loops.items():
-            if label in loop.entries or label in loop.body:
-                loop_exit = list(loop.exits)[0]
-                break
-        # if the branch statement locates at the end
-        # of the loop, then it's not an if statement
-        for src, _ in cfg.predecessors(loop_exit):
-            if src == label:
-                return False
-    return True
-
 def compute_unnecessary_variables(block, label, loops, cfg):
     """
     Fold unnecessary statements in the given blocks.
@@ -75,9 +58,6 @@ def compute_unnecessary_variables(block, label, loops, cfg):
         return unnecessary_vars
 
     if not is_in_any_loop(label, loops):
-        return unnecessary_vars
-
-    if is_if_branch(label, loops, cfg):
         return unnecessary_vars
 
     if isinstance(block.body[-1], ir.Jump):
@@ -171,8 +151,10 @@ def convert_stmt_to_node(stmt,
         if isinstance(stmt.value, ir.Global):
             if stmt.value.name == 'range':
                 ssa_var_map[target_name] = ast.Name(id='range', ctx=ast.Load())
-            if stmt.value.name == 'np':
+            elif stmt.value.name == 'np':
                 ssa_var_map[target_name] = ast.Name(id='np', ctx=ast.Load())
+            elif stmt.value.name == 'bool':
+                ssa_var_map[target_name] = ast.Name(id='bool', ctx=ast.Load())
 
         # R.H.S is Expression
         if isinstance(stmt.value, ir.Expr) and stmt.value.op == 'call':
@@ -187,14 +169,19 @@ def convert_stmt_to_node(stmt,
                 )
                 for arg in call_body['args']:
                     call_node.args.append(fetch_node_def(arg.name, ssa_var_map, ast.Load()))
-                if isinstance(func_node, ast.Name) and func_node.id == 'range':
-                    return ast.For(
-                        target=None,
-                        iter=call_node,
-                        body=[],
-                        orelse=[]
-                    )
-                else:
+                if isinstance(func_node, ast.Name):
+                    if func_node.id == 'bool':
+                        return return_or_store(target_name,
+                                               fetch_node_def(call_body['args'][0].name, ssa_var_map, ast.Load()),
+                                               ssa_var_map)
+                    elif func_node.id == 'range':
+                        return ast.For(
+                            target=None,
+                            iter=call_node,
+                            body=[],
+                            orelse=[]
+                        )
+                elif isinstance(func_node, ast.Attribute):
                     return ast.Assign(
                         targets=[ast.Name(id=target_name, ctx=ast.Store())],
                         value=call_node
@@ -337,7 +324,7 @@ def insert_while(cond_stmt_node):
         AST node representing the branch statement
     """
     return ast.While(
-        test=cond_stmt_node.value,  # Right subtree of the condition statement node
+        test=cond_stmt_node,  # Right subtree of the condition statement node
         body=[],  # Loop body is the node converted from the body block
         orelse=[]
     )
@@ -423,12 +410,13 @@ def convert_block_to_ast(label, loops, cfg, blocks, args, original_vars):
     unnecessary_vars = compute_unnecessary_variables(block, label, loops, cfg)
     ssa_var_map = defaultdict()
 
-    # Convert regular stmt to AST node
+    # Convert stmt to AST node
     for stmt in block.body:
-        if isinstance(stmt, ir.Assign) and stmt.target in unnecessary_vars:
-            continue
-        if isinstance(stmt, ir.Branch) and stmt.cond in unnecessary_vars:
-            continue
+        if not is_loop_entry(label, loops):
+            if isinstance(stmt, ir.Assign) and stmt.target in unnecessary_vars:
+                continue
+            if isinstance(stmt, ir.Branch) and stmt.cond in unnecessary_vars:
+                continue
         ast_node = convert_stmt_to_node(stmt,
                                         inplace_ops,
                                         arithmetic_ops,
@@ -449,11 +437,9 @@ def convert_block_to_ast(label, loops, cfg, blocks, args, original_vars):
     if isinstance(block.body[-1], ir.Branch):
         # If the block is loop entry
         if is_loop_entry(label, loops):
-            cond_stmt_node = ast_nodes.pop()
+            cond_var = block.body[-1].cond.name
+            cond_stmt_node = ssa_var_map[cond_var]
             ast_nodes.append(insert_while(cond_stmt_node))
-        # elif is_if_branch(label, loops, cfg):
-        #     cond_stmt_node = ast_nodes.pop()
-        #     ast_nodes.append(insert_if(cond_stmt_node))
 
     return ast_nodes
 
