@@ -16,6 +16,7 @@ def test_loop():
     for i in range(10):
         for j in range(10):
             x += i * j
+    x += 1
     return x
 
 

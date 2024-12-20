@@ -26,21 +26,23 @@ def build_ast_graph(node, graph=None, parent=None):
     node_id = str(id(node))
     label = type(node).__name__
 
-    # set node name
+    # Set node label for specific AST types
     if isinstance(node, ast.Constant):
         label += f"\\n{node.value}"
     elif isinstance(node, ast.Name):
         label += f"\\n{node.id}"
     elif isinstance(node, ast.BinOp):
         label += f"\\n{type(node.op).__name__}"
+    elif isinstance(node, ast.Attribute):
+        label += f"\\n{node.attr}"
 
     graph.node(node_id, label)
 
-    # draw an edge between current node and its parent node
+    # Draw an edge between current node and its parent node
     if parent is not None:
         graph.edge(parent, node_id)
 
-    # recursively draw children of current node (draw subtrees)
+    # Recursively draw children of current node (draw subtrees)
     for child_name, child in ast.iter_fields(node):
         if isinstance(child, ast.AST):
             build_ast_graph(child, graph, node_id)
