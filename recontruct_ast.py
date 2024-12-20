@@ -1,5 +1,6 @@
 import ast
 import operator
+import re
 from collections import defaultdict
 
 from numba.core import ir
@@ -92,9 +93,9 @@ def compute_unnecessary_variables(block, label, loops, cfg):
     return unnecessary_vars
 
 
-def fetch_node_def(var_name, map, ast_ctx):
-    if var_name in map:
-        return map[var_name]
+def fetch_node_def(var_name, var_map, ast_ctx):
+    if var_name in var_map:
+        return var_map[var_name]
     else:
         return ast.Name(id=var_name, ctx=ast_ctx)
 
@@ -169,37 +170,30 @@ def convert_stmt_to_node(stmt,
 
         # R.H.S of Assign is Const
         elif isinstance(stmt.value, ir.Const):
-            # SSA var created for constant
-            if '$const' in stmt.target.name:
-                ssa_var_map[stmt.target.name] = ast.Constant(value=stmt.value.value)
-            else:
-                return ast.Assign(
-                    targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                    value=ast.Constant(value=stmt.value.value)
-                )
+            const_node = ast.Constant(value=stmt.value.value)
+            return return_or_store(stmt.target.name, const_node, ssa_var_map)
 
         # R.H.S of Assign is a binop
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'binop':
             # binop is an arithmetic operation
+            op_node = None
             if stmt.value.fn in arithmetic_ops:
-                return ast.Assign(
-                    targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                    value=ast.BinOp(
-                        left=fetch_node_def(stmt.value.lhs.name, ssa_var_map, ast.Load()),
-                        op=arithmetic_ops[stmt.value.fn],
-                        right=fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load()),
-                    ),
+                op_node = ast.BinOp(
+                    left=fetch_node_def(stmt.value.lhs.name, ssa_var_map, ast.Load()),
+                    op=arithmetic_ops[stmt.value.fn],
+                    right=fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load()),
                 )
             # binop is a compare operation
             if stmt.value.fn in compare_ops:
-                return ast.Assign(
-                    targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                    value=ast.Compare(
-                        left=fetch_node_def(stmt.value.lhs.name, ssa_var_map, ast.Load()),
-                        ops=[compare_ops[stmt.value.fn]],
-                        comparators=[fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load())],
-                    ),
+                op_node = ast.Compare(
+                    left=fetch_node_def(stmt.value.lhs.name, ssa_var_map, ast.Load()),
+                    ops=[compare_ops[stmt.value.fn]],
+                    comparators=[fetch_node_def(stmt.value.rhs.name, ssa_var_map, ast.Load())],
                 )
+            if op_node is not None:
+                return return_or_store(stmt.target.name, op_node, ssa_var_map)
+            else:
+                raise ValueError("Unsupported binary operation!")
 
         # R.H.S of Assign is inplace binop, e.g., x += 1 -> $tmp = inplace(add, x, 1)
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'inplace_binop':
@@ -212,62 +206,65 @@ def convert_stmt_to_node(stmt,
 
         # Expr
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'cast':
-            return ast.Assign(
-                targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                value=ast.Name(id=stmt.value._kws['value'], ctx=ast.Load()),
-            )
+            var_node = ast.Name(id=stmt.value._kws['value'], ctx=ast.Load())
+            return return_or_store(stmt.target.name, var_node, ssa_var_map)
 
         # Build tuple, e.g., [i, j] of A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'build_tuple':
-            tuple_node = ast.Tuple(
-                elts=[],
-                ctx=ast.Load()
-            )
+            tuple_node = ast.Tuple(elts=[], ctx=ast.Load())
             for var in stmt.value.items:
                 tuple_node.elts.append(fetch_node_def(var.name, ssa_var_map, ast.Load()))
-            ssa_var_map[stmt.target] = tuple_node
-            # return tuple_node
+            return return_or_store(stmt.target.name, tuple_node, ssa_var_map)
 
         # Subscripting, e.g., A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getitem":
-            value_node = ssa_var_map.get(stmt.value.value)
-            slice_node = ssa_var_map.get(stmt.value.index)
-            const_slice_node = fetch_node_def(stmt.value.index.name, ssa_var_map, ast.Load())
+            value_node = fetch_node_def(stmt.value.value.name, ssa_var_map, ast.Load())
+            slice_node = fetch_node_def(stmt.value.index.name, ssa_var_map, ast.Load())
             subscript_node = ast.Subscript(
-                value=ast.Name(id=stmt.value.value, ctx=ast.Load()) if value_node is None else value_node,
-                slice=None,
+                value=value_node,
+                slice=slice_node,
                 ctx=ast.Load()
             )
+            return return_or_store(stmt.target.name, subscript_node, ssa_var_map)
 
-            if slice_node is not None:
-                subscript_node.slice = slice_node
-            else:
-                subscript_node.slice = const_slice_node
-
-            return ast.Assign(
-                targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                value=subscript_node
-            )
-
-        # Get attribute, e.g., A.shape[0]
+        # Get attribute, e.g., A.shape, np.zeros
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getattr":
-            value_node = ssa_var_map.get(stmt.value.value)
             attribute_node = ast.Attribute(
-                value=ast.Name(id=stmt.value.value, ctx=ast.Load()) if value_node is None else value_node,
+                value=fetch_node_def(stmt.value.value.name, ssa_var_map, ast.Load()),
                 attr=stmt.value.attr,
                 ctx=ast.Load()
             )
-            ssa_var_map[stmt.target] = attribute_node
-            # return attribute_node
+            return return_or_store(stmt.target.name, attribute_node, ssa_var_map)
+
+    # Deal with y[i] = ...
+    elif isinstance(stmt, ir.SetItem):
+        rhs_node = fetch_node_def(stmt.value.name, ssa_var_map, ast.Load())
+        subscript_node = ast.Subscript(
+            value=ast.Name(id=stmt.target.name, ctx=ast.Load()),
+            slice=ast.Name(id=stmt.index.name, ctx=ast.Load()),
+            ctx=ast.Load()
+        )
+        return ast.Assign(
+            targets=[subscript_node],
+            value=rhs_node
+        )
 
     # Return
     elif isinstance(stmt, ir.Return):
-        return ast.Return(
-            value=ast.Name(id=stmt.value.name, ctx=ast.Load())
-        )
+        var_node = fetch_node_def(stmt.value.name, ssa_var_map, ast.Load())
+        return ast.Return(value=var_node)
 
     return None
 
+def return_or_store(var_name, ast_node, var_map):
+    if "$" in var_name:
+        var_map[var_name] = ast_node
+        return None
+    else:
+        return ast.Assign(
+            targets=[var_name],
+            value=ast_node
+        )
 
 def insert_while(cond_stmt_node):
     """

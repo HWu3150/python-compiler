@@ -35,6 +35,8 @@ def build_ast_graph(node, graph=None, parent=None):
         label += f"\\n{type(node.op).__name__}"
     elif isinstance(node, ast.Attribute):
         label += f"\\n{node.attr}"
+    elif isinstance(node, ast.arg):
+        label += f"\\n{node.arg}"  # Show argument name
 
     graph.node(node_id, label)
 
