@@ -92,7 +92,22 @@ def compute_unnecessary_variables(block, label, loops, cfg):
     return unnecessary_vars
 
 
-def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops, compare_ops):
+def fetch_node_def(var_name, map, ast_ctx):
+    if var_name in map:
+        return map[var_name]
+    else:
+        return ast.Name(id=var_name, ctx=ast_ctx)
+
+
+def convert_stmt_to_node(stmt,
+                         inplace_ops,
+                         arithmetic_ops,
+                         compare_ops,
+                         aug_assigns_targets,
+                         usage_map,
+                         call_map,
+                         const_map,
+                         args):
     """
     Args:
     SSA statement
@@ -107,14 +122,40 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
         if 'phi' in stmt.target.name or 'iter' in stmt.target.name:
             return None
 
+        # Function argument
+        if isinstance(stmt.value, ir.Arg):
+            args.append(ast.arg(
+                arg=stmt.value.name
+            ))
+
         if isinstance(stmt.value, ir.Global):
             if stmt.value.name == 'range':
-                return ast.Call(
-                    func=ast.Name(id='range', ctx=ast.Load()),
-                    args=[],
-                    keywords=[]
-                )
+                call_map[stmt.target.name] = ast.Name(id='range', ctx=ast.Load())
+            if stmt.value.name == 'np':
+                call_map[stmt.target.name] = ast.Name(id='np', ctx=ast.Load())
 
+        if isinstance(stmt.value, ir.Expr) and stmt.value.op == 'call':
+            call_body = stmt.value._kws
+            func_name = call_body['func'].name
+            if func_name in call_map:
+                func_node = call_map[func_name]
+                if isinstance(func_node, ast.Name) and func_node.id == 'range':
+                    call_node = ast.Call(
+                        func=func_node,
+                        args=[],
+                        keywords=[]
+                    )
+                    for arg in call_body['args']:
+                        call_node.args.append(fetch_node_def(arg.name, const_map, ast.Load()))
+                    for_node = ast.For(
+                        target=None,
+                        iter=call_node,
+                        body=[],
+                        orelse=[]
+                    )
+                    return for_node
+
+        # R.H.S of Assign is a Variable
         if isinstance(stmt.value, ir.Var):
             if 'phi' in stmt.value.name or 'iter' in stmt.value.name:
                 return None
@@ -126,10 +167,14 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
 
         # R.H.S of Assign is Const
         elif isinstance(stmt.value, ir.Const):
-            return ast.Assign(
-                targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
-                value=ast.Constant(value=stmt.value.value),
-            )
+            # SSA var created for constant
+            if '$const' in stmt.target.name:
+                const_map[stmt.target.name] = ast.Constant(value=stmt.value.value)
+            else:
+                return ast.Assign(
+                    targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
+                    value=ast.Constant(value=stmt.value.value)
+                )
 
         # R.H.S of Assign is a binop
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'binop':
@@ -138,9 +183,9 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
                 return ast.Assign(
                     targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
                     value=ast.BinOp(
-                        left=ast.Name(id=stmt.value.lhs.name, ctx=ast.Load()),
+                        left=fetch_node_def(stmt.value.lhs.name, const_map, ast.Load()),
                         op=arithmetic_ops[stmt.value.fn],
-                        right=ast.Name(id=stmt.value.rhs.name, ctx=ast.Load()),
+                        right=fetch_node_def(stmt.value.rhs.name, const_map, ast.Load()),
                     ),
                 )
             # binop is a compare operation
@@ -148,9 +193,9 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
                 return ast.Assign(
                     targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
                     value=ast.Compare(
-                        left=ast.Name(id=stmt.value.lhs.name, ctx=ast.Load()),
+                        left=fetch_node_def(stmt.value.lhs.name, const_map, ast.Load()),
                         ops=[compare_ops[stmt.value.fn]],
-                        comparators=[ast.Name(id=stmt.value.rhs.name, ctx=ast.Load())],
+                        comparators=[fetch_node_def(stmt.value.rhs.name, const_map, ast.Load())],
                     ),
                 )
 
@@ -158,9 +203,9 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'inplace_binop':
             aug_assigns_targets.append(stmt.target)
             return ast.AugAssign(
-                target=ast.Name(id=stmt.value.lhs.name, ctx=ast.Store()),
+                target=fetch_node_def(stmt.value.lhs.name, const_map, ast.Store()),
                 op=inplace_ops[stmt.value.fn],
-                value=ast.Name(id=stmt.value.rhs.name, ctx=ast.Load()),
+                value=fetch_node_def(stmt.value.rhs.name, const_map, ast.Load()),
             )
 
         # Expr
@@ -170,24 +215,48 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
                 value=ast.Name(id=stmt.value._kws['value'], ctx=ast.Load()),
             )
 
-        # Build tuple, e.g., A[i, j]
+        # Build tuple, e.g., [i, j] of A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == 'build_tuple':
             tuple_node = ast.Tuple(
                 elts=[],
                 ctx=ast.Load()
             )
             for var in stmt.value.items:
-                tuple_node.elts.append(ast.Name(id=var.name, ctx=ast.Load()))
-            return tuple_node
+                tuple_node.elts.append(fetch_node_def(var.name, const_map, ast.Load()))
+            usage_map[stmt.target] = tuple_node
+            # return tuple_node
 
+        # Subscripting, e.g., A[i, j]
         elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getitem":
-            return ast.Subscript(
-                value=ast.Name(id=stmt.value.value, ctx=ast.Load()),
+            value_node = usage_map.get(stmt.value.value)
+            slice_node = usage_map.get(stmt.value.index)
+            const_slice_node = fetch_node_def(stmt.value.index.name, const_map, ast.Load())
+            subscript_node = ast.Subscript(
+                value=ast.Name(id=stmt.value.value, ctx=ast.Load()) if value_node is None else value_node,
                 slice=None,
                 ctx=ast.Load()
             )
 
-    # TODO, jump statement from if-else branch
+            if slice_node is not None:
+                subscript_node.slice = slice_node
+            else:
+                subscript_node.slice = const_slice_node
+
+            return ast.Assign(
+                targets=[ast.Name(id=stmt.target.name, ctx=ast.Store())],
+                value=subscript_node
+            )
+
+        # Get attribute, e.g., A.shape[0]
+        elif isinstance(stmt.value, ir.Expr) and stmt.value.op == "getattr":
+            value_node = call_map.get(stmt.value.value)
+            attribute_node = ast.Attribute(
+                value=ast.Name(id=stmt.value.value, ctx=ast.Load()) if value_node is None else value_node,
+                attr=stmt.value.attr,
+                ctx=ast.Load()
+            )
+            usage_map[stmt.target] = attribute_node
+            # return attribute_node
 
     # Return
     elif isinstance(stmt, ir.Return):
@@ -195,7 +264,6 @@ def convert_stmt_to_node(stmt, aug_assigns_targets, inplace_ops, arithmetic_ops,
             value=ast.Name(id=stmt.value.name, ctx=ast.Load())
         )
 
-    # Unsupported statement type
     return None
 
 
@@ -220,7 +288,21 @@ def insert_if(cond_stmt_node):
         orelse=[]
     )
 
-def insert_for(label, loops, cfg, blocks, call_node):
+def process_for_node(label, loops, cfg, blocks, for_node):
+    """
+    Find the loop variant variable of the AST For node.
+    e.g. var i of the for loop: for i in range(10)
+
+    Args:
+        label: Label of the basic block.
+        loops: A dictionary mapping loop headers to loop information.
+        cfg: CFG.
+        blocks: Basic blocks.
+        for_node: AST For node to be processed.
+
+    Returns:
+        Processed For node.
+    """
     loop_header_label = int()
     for src, _ in cfg.successors(label):
         if src in loops:
@@ -229,21 +311,21 @@ def insert_for(label, loops, cfg, blocks, call_node):
     true_condition_label = blocks[loop_header_label].body[-1].truebr
     loop_var = blocks[true_condition_label].body[0].target
 
-    return ast.For(
-        target=ast.Name(id=loop_var, ctx=ast.Store()),
-        iter=call_node,
-        body=[],
-        orelse=[]
+    for_node.target = ast.Name(
+        id=loop_var,
+        ctx=ast.Load()
     )
 
-def convert_block_to_ast(block, label, loops, cfg, blocks):
+    return for_node
+
+def convert_block_to_ast(label, loops, cfg, blocks, args):
     """
     Args:
-        block: Basic block
-        label: Label of the block
+        label: Label of the basic block.
         loops: A dictionary mapping loop headers to loop information.
-        cfg: CFG
-        blocks: Basic blocks
+        cfg: CFG.
+        blocks: Basic blocks.
+        args: Arguments of the function.
 
     Returns:
         List of AST nodes representing the block
@@ -274,30 +356,36 @@ def convert_block_to_ast(block, label, loops, cfg, blocks):
         operator.gt: ast.Gt()
     }
 
+    block = blocks[label]
+
     ast_nodes = list()
     unnecessary_vars = compute_unnecessary_variables(block, label, loops, cfg)
     aug_assign_targets = list()
+    getitem_usage_map = defaultdict()
+    call_map = defaultdict()
+    const_map = defaultdict()
 
     # Convert regular stmt to AST node
-    stmts = block.body
-    i = 0
-    while i < len(stmts):
-        if isinstance(stmts[i], ir.Assign) and stmts[i].target in unnecessary_vars:
-            i += 1
+    for stmt in block.body:
+        if isinstance(stmt, ir.Assign) and stmt.target in unnecessary_vars:
             continue
-        if isinstance(stmts[i], ir.Branch) and stmts[i].cond in unnecessary_vars:
-            i += 1
+        if isinstance(stmt, ir.Branch) and stmt.cond in unnecessary_vars:
             continue
-        ast_node = convert_stmt_to_node(stmts[i], aug_assign_targets, inplace_ops, arithmetic_ops, compare_ops)
+        ast_node = convert_stmt_to_node(stmt,
+                                        inplace_ops,
+                                        arithmetic_ops,
+                                        compare_ops,
+                                        aug_assign_targets,
+                                        getitem_usage_map,
+                                        call_map,
+                                        const_map,
+                                        args)
         if ast_node is not None:
-            if isinstance(ast_node, ast.Call) and isinstance(ast_node.func, ast.Name) and ast_node.func.id == 'range':
-                ast_node.args.append(ast.Constant(value=stmts[i+1].value.value))
-                for_node = insert_for(label, loops, cfg, blocks, ast_node)
+            if isinstance(ast_node, ast.For):
+                for_node = process_for_node(label, loops, cfg, blocks, ast_node)
                 ast_nodes.append(for_node)
-                return ast_nodes
             else:
                 ast_nodes.append(ast_node)
-        i += 1
 
     # Deal with Branch statement
     # Branch could be in loop entry or body
@@ -307,9 +395,9 @@ def convert_block_to_ast(block, label, loops, cfg, blocks):
         if is_loop_entry(label, loops):
             cond_stmt_node = ast_nodes.pop()
             ast_nodes.append(insert_while(cond_stmt_node))
-        elif is_if_branch(label, loops, cfg):
-            cond_stmt_node = ast_nodes.pop()
-            ast_nodes.append(insert_if(cond_stmt_node))
+        # elif is_if_branch(label, loops, cfg):
+        #     cond_stmt_node = ast_nodes.pop()
+        #     ast_nodes.append(insert_if(cond_stmt_node))
 
     return ast_nodes
 
@@ -346,11 +434,12 @@ def construct_ast(blocks):
     """
     cfg = compute_cfg_from_blocks(blocks)
     loops = cfg._find_loops()
+    arg_list = list()
 
     # Compute AST node list of each block
     all_ast_nodes = defaultdict(list)
     for label, block in blocks.items():
-        ast_nodes = convert_block_to_ast(block, label, loops, cfg, blocks)
+        ast_nodes = convert_block_to_ast(label, loops, cfg, blocks, arg_list)
         all_ast_nodes[label] = ast_nodes
 
     loop_body_of_entries = defaultdict(list)
@@ -361,20 +450,57 @@ def construct_ast(blocks):
     # Compute dominator tree
     dom_tree = cfg.dominator_tree()
 
-    for entry_label, body in sorted(loop_body_of_entries.items(), key=lambda x: x[0], reverse=True):
-        dominated_blocks = dom_tree[entry_label]
-        for label in dominated_blocks:
-            if label in loop_body_of_entries[entry_label]:
-                for node in all_ast_nodes[entry_label]:
-                    if isinstance(node, ast.While):
-                        node.body.extend(all_ast_nodes[label])
-            else:
-                all_ast_nodes[entry_label].extend(all_ast_nodes[label])
+    # for entry_label, body in sorted(loop_body_of_entries.items(), key=lambda x: x[0], reverse=True):
+    #     dominated_blocks = dom_tree[entry_label]
+    #     for label in dominated_blocks:
+    #         if label in loop_body_of_entries[entry_label]:
+    #             for node in all_ast_nodes[entry_label]:
+    #                 if isinstance(node, ast.While) or isinstance(node, ast.For):
+    #                     node.body.extend(all_ast_nodes[label])
+    #         else:
+    #             all_ast_nodes[entry_label].extend(all_ast_nodes[label])
+
+    def recursive_construct(block_label, depth=0):
+        """
+        Recursively construct AST.
+
+        Args:
+            block_label: Label of the basic block.
+            depth: AST depth.
+
+        Returns:
+            AST node list.
+        """
+        nodes = all_ast_nodes[block_label]  # List of AST nodes of current block
+        child_labels = dom_tree.get(block_label, set())  # Fetch dominated children blocks
+
+        # If current block is loop entry
+        if block_label in loop_body_of_entries:
+            loop_node = nodes[-1]   # Last node must be loop node
+
+            # Process blocks in loop body
+            for child_label in child_labels:
+                # If child block belongs to loop body
+                if child_label in loop_body_of_entries[block_label]:
+                    loop_node.body.extend(recursive_construct(child_label, depth + 1))
+                else:
+                    # Skip non-loop-body blocks for now
+                    pass
+
+        # Process same-depth dominated children blocks
+        for child_label in child_labels:
+            if child_label not in loop_body_of_entries.get(block_label, set()):  # 不属于 loop body
+                nodes.extend(recursive_construct(child_label, depth))
+
+        return nodes
+
+    # Function body
+    func_body = recursive_construct(0)
 
     # Function arguments
     args = ast.arguments(
         posonlyargs=[],
-        args=[],
+        args=arg_list,
         vararg=None,
         kwonlyargs=[],
         kw_defaults=[],
@@ -382,14 +508,11 @@ def construct_ast(blocks):
         defaults=[]
     )
 
-    # Function body
-    body = all_ast_nodes[0]
-
     # Function node
     func_def = ast.FunctionDef(
         name="func",
         args=args,
-        body=body,
+        body=func_body,
         decorator_list=[],
         returns=None
     )
