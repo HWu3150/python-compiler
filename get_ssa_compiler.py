@@ -35,3 +35,15 @@ class GetSSACompiler(CompilerBase):
         pm.add_pass_after(GetSSAPass, IRProcessing)
         pm.finalize()
         return [pm]
+
+def clear(ssa_by_blks, blks):
+    ssa_by_blks.clear()
+    blks.clear()
+
+def print_ssa(ssa_by_blks):
+    print("SSA Statements Grouped by Block:")
+    for blk_offset, ssa_list in ssa_by_blks.items():
+        print(f"Block {blk_offset}:")
+        for stmt in ssa_list:
+            print(f"  {stmt}")
+    print()

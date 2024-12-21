@@ -1,6 +1,6 @@
 from numba import njit
 
-from get_ssa_compiler import GetSSACompiler, ssa_by_blocks, blocks
+from get_ssa_compiler import GetSSACompiler, ssa_by_blocks, blocks, print_ssa, clear
 from graph_viz import viz_ast_and_cfg
 
 import numba
@@ -20,16 +20,8 @@ def test_while_loop():
     return x
 
 
-ssa_by_blocks.clear()
-blocks.clear()
-func_ir = None
 
+clear(ssa_by_blocks, blocks)
 test_while_loop()
-print("SSA Statements Grouped by Block:")
-for blk_offset, ssa_list in ssa_by_blocks.items():
-    print(f"Block {blk_offset}:")
-    for stmt in ssa_list:
-        print(f"  {stmt}")
-print()
-
+print_ssa(ssa_by_blocks)
 viz_ast_and_cfg(blocks, test_while_loop)
