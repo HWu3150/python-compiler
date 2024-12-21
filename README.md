@@ -89,3 +89,6 @@ dense_mv(np.zeros((2, 2)), np.zeros(2))
 print_ssa(ssa_by_blocks)
 viz_ast_and_cfg(blocks, dense_mv)
 ```
+
+## Test Files
+Several test files are created, each containing one target function. Feel free to run them!
